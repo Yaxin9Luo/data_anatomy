@@ -85,7 +85,7 @@ def main() -> None:
         seed=args.seed,
     )
     K = len(ds.categories)
-
+    print("Training TF-IDF classifier...")
     # 2) Train classifier (TF-IDF baseline)
     model, clf_metrics, C = train_tfidf_classifier(
         ds.train.texts,
@@ -95,7 +95,7 @@ def main() -> None:
         seed=args.seed,
         n_jobs=args.n_jobs,
     )
-
+    print(f"Classifier trained! Validation accuracy: {clf_metrics['val_acc']:.3f}")
     # 3) Gather model generations or load cached
     if args.use_cached_generations:
         gen_texts = read_jsonl_texts(args.use_cached_generations)
