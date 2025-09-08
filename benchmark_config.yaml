@@ -1,0 +1,58 @@
+# Benchmark Configuration for Label-Shift Estimation Methods
+
+# Ground truth specifications for different models
+ground_truth_specs:
+  llama-1: "bench/specs/llama-1.yaml"
+  # Add more models as needed
+  # llama-2: "bench/specs/llama-2.yaml"
+  # gpt-3: "bench/specs/gpt-3.yaml"
+
+# Method configurations
+methods:
+  tfidf_baseline_6class:
+    name: "TF-IDF + LogReg (6-class merged web)"
+    description: "Baseline method using TF-IDF features with merged CommonCrawl+C4"
+    results_dir: "out/labelshift_llama7b"
+    
+  # Template for 7-class methods (preferred)
+  # tfidf_baseline_7class:
+  #   name: "TF-IDF + LogReg (7-class)"
+  #   description: "Baseline method with separate CommonCrawl and C4 categories"
+  #   results_dir: "out/labelshift_llama7b_7class"
+  
+  # Template for additional methods
+  # improved_method:
+  #   name: "Improved Method"
+  #   description: "Description of your method"
+  #   results_dir: "out/improved_method"
+
+# Evaluation settings
+evaluation:
+  metrics:
+    - l1_distance
+    - l2_distance
+    - kl_divergence
+    - mean_absolute_error
+    - max_absolute_error
+    - coverage_rate  # For methods with confidence intervals
+  
+  output_formats:
+    - table  # Console table output
+    - markdown  # Markdown report
+    - plots  # Comparison plots
+    - json  # Machine-readable results
+
+# Visualization settings
+plots:
+  figure_size: [15, 12]
+  dpi: 300
+  formats: ["png", "pdf"]  # Output formats
+  style: "seaborn"  # Matplotlib style
+  
+  categories_display:
+    rotation: 45  # X-axis label rotation
+    fontsize: 10
+    
+  colors:
+    ground_truth: "black"
+    method_palette: "Set3"  # Color palette for methods
