@@ -3,4 +3,4 @@ data_samples/
 *.jsonl.zst
 *.jsonl
 __pycache__/
-benchmark_results/
+benchmark_output/
