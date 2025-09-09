@@ -24,6 +24,9 @@ NEUTRAL_PROMPTS = [
     "Key ideas:",
     "Context:",
     "Notes:",
+    "Title:",
+    "Abstract:",
+    "Overview:",
     "Observation:",
     "Conclusion:",
     "The text continues:",
@@ -36,7 +39,10 @@ NEUTRAL_PROMPTS = [
     "Rationale:",
     "Motivation:",
     "Discussion:",
-] * 10  # 300 generic prompts
+    " ",
+    "\n",
+    "\n\n",
+] * 10  
 CATEGORY_STYLE_PROMPTS = {
     # CommonCrawl (raw-ish web; include light HTML/boilerplate cues)
     "commoncrawl": [
