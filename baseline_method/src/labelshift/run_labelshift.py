@@ -7,8 +7,8 @@ import numpy as np
 from tqdm import tqdm
 
 from data_utils import build_balanced_splits
-from classifier import train_tfidf_classifier
-from generate import generate_texts, DEFAULT_PROMPTS
+from classifier import train_tfidf_classifier, train_distilbert_classifier
+from generate import generate_texts, NEUTRAL_PROMPTS
 from prior import estimate_priors_least_squares, bootstrap_priors
 from viz import plot_confusion_matrix, plot_priors_with_ci, plot_pbar_vs_ctpi
 
@@ -25,23 +25,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
 
     # Classifier
-    p.add_argument("--classifier", type=str, choices=["tfidf"], default="tfidf")
+    p.add_argument("--classifier", type=str, choices=["tfidf", "distilbert"], default="tfidf")
     p.add_argument("--n_jobs", type=int, default=4)
     p.add_argument("--predict_batch_size", type=int, default=256)
+    p.add_argument("--clf_verbose", type=int, default=0)
+
+    # HF classifier (DistilBERT) options
+    p.add_argument("--hf_model_name", type=str, default="distilbert/distilbert-base-uncased")
+    p.add_argument("--hf_epochs", type=int, default=3)
+    p.add_argument("--hf_batch_size", type=int, default=64)
+    p.add_argument("--hf_lr", type=float, default=2e-5)
+    p.add_argument("--hf_weight_decay", type=float, default=0.01)
+    p.add_argument("--hf_max_length", type=int, default=256)
 
     # Generations
     p.add_argument("--target_model", type=str, required=False, help="HF model name to sample from (e.g., huggyllama/llama-7b)")
     p.add_argument("--use_cached_generations", type=str, default=None, help="Path to JSONL with {text} per line to skip generation")
-    p.add_argument("--num_prompts", type=int, default=100)
+    p.add_argument("--num_prompts", type=int, default=300)
     p.add_argument("--prompts_file", type=str, default=None)
-    p.add_argument("--max_new_tokens", type=int, default=200)
+    p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--gen_temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.9)
-    p.add_argument("--gen_batch_size", type=int, default=4)
+    p.add_argument("--gen_batch_size", type=int, default=8)
 
     # Bootstrap
     p.add_argument("--bootstrap", action="store_true")
-    p.add_argument("--n_boot", type=int, default=200)
+    p.add_argument("--n_boot", type=int, default=300)
 
     # Output
     p.add_argument("--output_dir", type=str, default=str(Path(__file__).resolve().parents[1] / "out"))
@@ -85,16 +94,35 @@ def main() -> None:
         seed=args.seed,
     )
     K = len(ds.categories)
-    print("Training TF-IDF classifier...")
-    # 2) Train classifier (TF-IDF baseline)
-    model, clf_metrics, C = train_tfidf_classifier(
-        ds.train.texts,
-        ds.train.labels,
-        ds.val.texts,
-        ds.val.labels,
-        seed=args.seed,
-        n_jobs=args.n_jobs,
-    )
+    # Prepare output directory early to store training logs/curves
+    out_dir = Path(args.output_dir) / args.run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Training classifier: {args.classifier}...")
+    # 2) Train classifier
+    if args.classifier == "tfidf":
+        model, clf_metrics, C = train_tfidf_classifier(
+            ds.train.texts,
+            ds.train.labels,
+            ds.val.texts,
+            ds.val.labels,
+            seed=args.seed,
+            n_jobs=args.n_jobs,
+            verbose=args.clf_verbose,
+        )
+    else:
+        model, clf_metrics, C = train_distilbert_classifier(
+            ds.train.texts,
+            ds.train.labels,
+            ds.val.texts,
+            ds.val.labels,
+            model_name=args.hf_model_name,
+            epochs=args.hf_epochs,
+            batch_size=args.hf_batch_size,
+            lr=args.hf_lr,
+            weight_decay=args.hf_weight_decay,
+            max_length=args.hf_max_length,
+            seed=args.seed,
+        )
     print(f"Classifier trained! Validation accuracy: {clf_metrics['val_acc']:.3f}")
     # 3) Gather model generations or load cached
     if args.use_cached_generations:
@@ -106,7 +134,7 @@ def main() -> None:
             prompts = load_prompts_from_file(args.prompts_file)
             prompts = prompts[: args.num_prompts]
         else:
-            prompts = DEFAULT_PROMPTS[: args.num_prompts]
+            prompts = NEUTRAL_PROMPTS[: args.num_prompts]
         gen_texts = generate_texts(
             model_name=args.target_model,
             prompts=prompts,
@@ -147,9 +175,7 @@ def main() -> None:
         lo = np.percentile(P, 2.5, axis=0)
         hi = np.percentile(P, 97.5, axis=0)
 
-    # 7) Write outputs
-    out_dir = Path(args.output_dir) / args.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # 7) Write outputs (out_dir already created)
 
     payload = {
         "config": {
@@ -163,6 +189,12 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "gen_temperature": args.gen_temperature,
             "top_p": args.top_p,
+            "hf_model_name": args.hf_model_name,
+            "hf_epochs": args.hf_epochs,
+            "hf_batch_size": args.hf_batch_size,
+            "hf_lr": args.hf_lr,
+            "hf_weight_decay": args.hf_weight_decay,
+            "hf_max_length": args.hf_max_length,
             "bootstrap": args.bootstrap,
             "n_boot": args.n_boot,
         },

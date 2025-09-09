@@ -5,19 +5,116 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
 
-DEFAULT_PROMPTS: List[str] = [
+NEUTRAL_PROMPTS = [
+    "Continue the passage:",
+    "Write the next paragraph:",
     "The following text discusses:",
     "Consider the following passage:",
     "In this article, we explore:",
     "Here is a paragraph about:",
-    "The problem can be described as:",
     "An overview of the topic:",
     "A short description:",
     "The statement is:",
     "This section covers:",
     "We now present:",
-] * 10  # 100 generic prompts
+    "Background:",
+    "Introduction:",
+    "Main text:",
+    "Details:",
+    "Key ideas:",
+    "Context:",
+    "Notes:",
+    "Observation:",
+    "Conclusion:",
+    "The text continues:",
+    "Opening lines:",
+    "Body paragraph:",
+    "Further explanation:",
+    "Elaboration:",
+    "Clarification:",
+    "Summary:",
+    "Rationale:",
+    "Motivation:",
+    "Discussion:",
+] * 10  # 300 generic prompts
+CATEGORY_STYLE_PROMPTS = {
+    # CommonCrawl (raw-ish web; include light HTML/boilerplate cues)
+    "commoncrawl": [
+        "<html><head><title>Article</title></head><body><article><h1>",
+        "<div class='content'><p>",
+        "By Staff Writer — Updated:",
+        "Breaking: ",
+        "Related posts:",
+        "Privacy Policy — ",
+        "Contact us:",
+    ],
 
+    # C4 (cleaned web articles; no HTML, news/blog tone, headings)
+    "c4": [
+        "Title:",
+        "Subtitle:",
+        "Introduction",
+        "Overview",
+        "Key takeaways:",
+        "Further reading:",
+        "Author’s note:",
+    ],
+
+    # GitHub (code/files/readmes across languages)
+    "github": [
+        "```python\n# Filename: utils.py\n\"\"\"Module description:\"\"\"\n",
+        "```javascript\n// file: app.js\n// Description:\n",
+        "```cpp\n// utils.hpp\n//",
+        "```go\n// Package docs:\n",
+        "README.md\n# Project Title\n",
+        "LICENSE\nMIT License\n",
+        "def solve():\n    \"\"\"",
+    ],
+
+    # Wikipedia (markup, sections, neutral tone)
+    "wikipedia": [
+        "== Introduction ==",
+        "{{Short description|}}",
+        "== History ==",
+        "== See also ==",
+        "== References ==\n* ",
+        "=== Background ===",
+        "Infobox:",
+    ],
+
+    # Books (long-form narrative/exposition)
+    "books": [
+        "Chapter 1\n",
+        "Prologue\n",
+        "It was a",
+        "The morning of",
+        "He said,",
+        "She remembered",
+        "The following chapter explores",
+    ],
+
+    # arXiv (LaTeX/math/paper structure)
+    "arxiv": [
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\title{",
+        "\\begin{abstract}\n",
+        "\\section{Introduction}\n",
+        "We prove the following theorem.",
+        "Definition.",
+        "Lemma.",
+        "Proof.",
+    ],
+
+    # StackExchange (Q/A format, tags, accepted-answer vibe)
+    "stackexchange": [
+        "Title: How do I\n\nQuestion:\n",
+        "Q:\nA:",
+        "Problem statement:\n",
+        "Accepted answer:\n",
+        "Steps to reproduce:",
+        "Tags: [python] [arrays]",
+        "Comment:",
+    ],
+}
 
 def load_hf_model(model_name: str):
     tok = AutoTokenizer.from_pretrained(model_name)
