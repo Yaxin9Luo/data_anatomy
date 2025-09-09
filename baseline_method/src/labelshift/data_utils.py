@@ -28,9 +28,9 @@ CATEGORIES_6 = [
 
 
 # Default mapping from local sample filenames to categories (6-class, merged web)
-# Includes backward-compatible aliases from earlier implementations.
 DEFAULT_FILE_TO_CAT_6: Dict[str, str] = {
-    # Web pool (C4 + CommonCrawl)
+    # Web pool (prefer a pre-merged file if present; else, pool C4 + CommonCrawl)
+    "web.jsonl": "Web",  # preferred explicit merged file
     "commoncrawl.jsonl": "Web",
     "c4.jsonl": "Web",
 
@@ -98,8 +98,23 @@ def detect_available_categories(local_dir: str, merge_web: bool = True) -> Tuple
     """
     files = set(os.listdir(local_dir)) if os.path.isdir(local_dir) else set()
     if merge_web:
-        mapping = {k: v for k, v in DEFAULT_FILE_TO_CAT_6.items() if k in files}
-        # If both C4 and CommonCrawl present, they will both contribute to the pooled 'Web'
+        # Prefer a single explicit merged web file if available. Always include other categories.
+        mapping: Dict[str, str] = {}
+        if "web.jsonl" in files or "webpages.jsonl" in files:
+            # Add non-web categories from defaults
+            for fname, cat in DEFAULT_FILE_TO_CAT_6.items():
+                if cat == "Web":
+                    continue  # skip raw web parts
+                if fname in files:
+                    mapping[fname] = cat
+            # Add exactly one merged web file
+            if "web.jsonl" in files:
+                mapping["web.jsonl"] = "Web"
+            else:
+                mapping["webpages.jsonl"] = "Web"
+        else:
+            # Fall back to pooling C4 + CommonCrawl implicitly by including both raw files
+            mapping = {k: v for k, v in DEFAULT_FILE_TO_CAT_6.items() if k in files}
         cats = sorted(set(mapping.values()), key=lambda c: CATEGORIES_6.index(c))
         return cats, mapping
     else:
@@ -190,8 +205,8 @@ def build_balanced_splits(
         if "C4" in categories:
             cat_to_texts.setdefault("C4", []).extend(c4[:max_per_class] if max_per_class else c4)
 
-    # If merge_web=True and both C4/CommonCrawl exist independently, pool them
-    if merge_web:
+    # If merge_web=True and no explicit merged file was read, optionally pool C4 + CommonCrawl
+    if merge_web and not cat_to_texts.get("Web"):
         web_pool: List[str] = []
         for fname in ("commoncrawl.jsonl", "c4.jsonl"):
             fpath = os.path.join(local_dir, fname)

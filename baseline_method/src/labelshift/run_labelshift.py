@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
 
     # Classifier
-    p.add_argument("--classifier", type=str, choices=["tfidf", "distilbert"], default="tfidf")
+    p.add_argument("--classifier", type=str, choices=["tfidf", "distilbert"], default="distilbert")
     p.add_argument("--n_jobs", type=int, default=4)
     p.add_argument("--predict_batch_size", type=int, default=256)
     p.add_argument("--clf_verbose", type=int, default=0)

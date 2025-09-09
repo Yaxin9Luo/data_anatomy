@@ -272,6 +272,11 @@ def train_distilbert_classifier(
             tok.add_special_tokens({"pad_token": "[PAD]"})
 
     mdl = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+    # Ensure correct loss type: single-label classification with CrossEntropy
+    try:
+        mdl.config.problem_type = "single_label_classification"
+    except Exception:
+        pass
     # If tokenizer added tokens, resize embeddings
     if hasattr(mdl, "resize_token_embeddings"):
         mdl.resize_token_embeddings(len(tok))

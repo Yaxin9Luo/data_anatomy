@@ -57,6 +57,9 @@ class LabelShiftBenchmark:
         """
         self.ground_truth_file = ground_truth_file
         self.ground_truth = self._load_ground_truth(ground_truth_file)
+        # Canonical 7-class order from ground truth spec
+        self.gt_categories_7 = list(self.ground_truth.keys())
+        # Back-compat: some methods still reference self.categories
         self.categories = list(self.ground_truth.keys())
         
     def _load_ground_truth(self, filepath: str) -> Dict[str, float]:
@@ -111,84 +114,176 @@ class LabelShiftBenchmark:
                 cat: (lo, hi) for cat, lo, hi in zip(categories, ci_lo, ci_hi)
             }
         
-        # Map categories to ground truth format if needed
-        estimates = self._map_categories(estimates)
-        if confidence_intervals:
-            confidence_intervals = self._map_categories_ci(confidence_intervals)
-        
+        # Do NOT map to ground truth yet. We'll align adaptively (6 vs 7 classes) later.
         method_name = results_path.name
+        meta = data.get('config', {}) or {}
+        meta['_original_categories'] = categories
         return MethodResult(
             name=method_name,
             estimates=estimates,
             confidence_intervals=confidence_intervals,
-            metadata=data.get('config', {})
+            metadata=meta,
         )
     
     def _map_categories(self, estimates: Dict[str, float]) -> Dict[str, float]:
-        """Map method categories to ground truth categories"""
-        # Handle common mappings
+        """Deprecated: legacy direct mapping. Kept for backward-compat but unused now."""
         mapped = {}
-        
         for gt_cat in self.ground_truth:
             if gt_cat in estimates:
-                # Direct match - use as is
                 mapped[gt_cat] = estimates[gt_cat]
             elif gt_cat == "GitHub" and "Code" in estimates:
-                # Map Code -> GitHub
                 mapped[gt_cat] = estimates["Code"]
             elif gt_cat == "Arxiv" and "Papers" in estimates:
-                # Map Papers -> Arxiv  
                 mapped[gt_cat] = estimates["Papers"]
             else:
-                # Try case-insensitive matching
                 for est_cat, val in estimates.items():
                     if est_cat.lower() == gt_cat.lower():
                         mapped[gt_cat] = val
                         break
                 else:
-                    # Category not found - warn user
-                    print(f"Warning: Category '{gt_cat}' not found in method results. Setting to 0.0")
                     mapped[gt_cat] = 0.0
-        
         return mapped
-    
+
     def _map_categories_ci(self, cis: Dict[str, Tuple[float, float]]) -> Dict[str, Tuple[float, float]]:
-        """Map confidence intervals using same logic as estimates"""
+        """Deprecated: legacy CI mapping. Kept for backward-compat but unused now."""
         mapped = {}
-        
         for gt_cat in self.ground_truth:
             if gt_cat in cis:
-                # Direct match - use as is
                 mapped[gt_cat] = cis[gt_cat]
             elif gt_cat == "GitHub" and "Code" in cis:
-                # Map Code -> GitHub
                 mapped[gt_cat] = cis["Code"]
             elif gt_cat == "Arxiv" and "Papers" in cis:
-                # Map Papers -> Arxiv
                 mapped[gt_cat] = cis["Papers"]
             else:
-                # Try case-insensitive matching
                 for est_cat, val in cis.items():
                     if est_cat.lower() == gt_cat.lower():
                         mapped[gt_cat] = val
                         break
                 else:
-                    # Category not found
                     mapped[gt_cat] = (0.0, 0.0)
-        
         return mapped
+
+    # ------------------------------
+    # Category alignment helpers
+    # ------------------------------
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        return name.strip().lower()
+
+    def _scheme_categories(self, scheme: str) -> List[str]:
+        if scheme == '6-class':
+            return ['Web', 'GitHub', 'Wikipedia', 'Books', 'Arxiv', 'StackExchange']
+        return self.gt_categories_7
+
+    def _merge_web_estimates(self, estimates: Dict[str, float]) -> Dict[str, float]:
+        out = dict(estimates)
+        cc_key = next((k for k in list(out.keys()) if self._norm_name(k) == 'commoncrawl'), None)
+        c4_key = next((k for k in list(out.keys()) if self._norm_name(k) == 'c4'), None)
+        web_val = 0.0
+        if cc_key is not None:
+            web_val += out.pop(cc_key)
+        if c4_key is not None:
+            web_val += out.pop(c4_key)
+        if web_val > 0.0:
+            out['Web'] = out.get('Web', 0.0) + web_val
+        return out
+
+    def _merge_web_cis(self, cis: Optional[Dict[str, Tuple[float, float]]]) -> Optional[Dict[str, Tuple[float, float]]]:
+        if cis is None:
+            return None
+        out = dict(cis)
+        cc_key = next((k for k in list(out.keys()) if self._norm_name(k) == 'commoncrawl'), None)
+        c4_key = next((k for k in list(out.keys()) if self._norm_name(k) == 'c4'), None)
+        lo_sum = hi_sum = 0.0
+        changed = False
+        if cc_key is not None:
+            lo, hi = out.pop(cc_key)
+            lo_sum += lo
+            hi_sum += hi
+            changed = True
+        if c4_key is not None:
+            lo, hi = out.pop(c4_key)
+            lo_sum += lo
+            hi_sum += hi
+            changed = True
+        if changed:
+            lo_web, hi_web = out.get('Web', (0.0, 0.0))
+            out['Web'] = (lo_web + lo_sum, hi_web + hi_sum)
+        return out
+
+    def _align(self, estimates: Dict[str, float], cis: Optional[Dict[str, Tuple[float, float]]], scheme: str) -> Tuple[List[str], np.ndarray, Optional[Dict[str, Tuple[float, float]]]]:
+        cats = self._scheme_categories(scheme)
+        est_local = estimates
+        cis_local = cis
+        if scheme == '6-class':
+            est_local = self._merge_web_estimates(est_local)
+            cis_local = self._merge_web_cis(cis_local)
+        out = {}
+        cis_out: Optional[Dict[str, Tuple[float, float]]] = {} if cis_local is not None else None
+        for cat in cats:
+            key = None
+            if cat in est_local:
+                key = cat
+            elif cat == 'GitHub' and 'Code' in est_local:
+                key = 'Code'
+            elif cat == 'Arxiv' and 'Papers' in est_local:
+                key = 'Papers'
+            else:
+                for k in est_local.keys():
+                    if self._norm_name(k) == self._norm_name(cat):
+                        key = k
+                        break
+            out[cat] = est_local.get(key, 0.0)
+            if cis_out is not None:
+                if cis_local and key in (cis_local.keys() if cis_local else []):
+                    cis_out[cat] = cis_local[key]  # type: ignore[index]
+                else:
+                    cis_out[cat] = (0.0, 0.0)
+        est_arr = np.array([out[c] for c in cats], dtype=float)
+        return cats, est_arr, cis_out
+
+    def _align_ground_truth(self, scheme: str) -> Tuple[List[str], np.ndarray]:
+        if scheme == '6-class':
+            gt = dict(self.ground_truth)
+            cc = gt.pop('CommonCrawl', 0.0)
+            c4 = gt.pop('C4', 0.0)
+            gt['Web'] = gt.get('Web', 0.0) + cc + c4
+            cats = self._scheme_categories('6-class')
+            arr = np.array([gt.get(c, 0.0) for c in cats], dtype=float)
+            s = arr.sum()
+            if s > 0:
+                arr = arr / s
+            return cats, arr
+        cats = self._scheme_categories('7-class')
+        arr = np.array([self.ground_truth[c] for c in cats], dtype=float)
+        return cats, arr
+
+    def _decide_scheme_for_methods(self, methods: List[MethodResult]) -> str:
+        for m in methods:
+            cats = m.metadata.get('_original_categories') if m.metadata else None
+            if cats and any(self._norm_name(c) == 'web' for c in cats):
+                return '6-class'
+            if cats:
+                has_cc = any(self._norm_name(c) == 'commoncrawl' for c in cats)
+                has_c4 = any(self._norm_name(c) == 'c4' for c in cats)
+                if has_cc ^ has_c4:
+                    return '6-class'
+        return '7-class'
     
     def evaluate_method(self, results_dir: str) -> Tuple[MethodResult, BenchmarkMetrics]:
-        """Evaluate a single method against ground truth"""
+        """Evaluate a single method against ground truth (adaptive 6/7-class)."""
         method_result = self._load_method_results(results_dir)
-        metrics = self._compute_metrics(method_result)
+        scheme = self._decide_scheme_for_methods([method_result])
+        metrics = self._compute_metrics(method_result, scheme)
         return method_result, metrics
     
-    def _compute_metrics(self, method_result: MethodResult) -> BenchmarkMetrics:
-        """Compute evaluation metrics for a method"""
-        # Align categories and get arrays
-        true_probs = np.array([self.ground_truth[cat] for cat in self.categories])
-        est_probs = np.array([method_result.estimates.get(cat, 0.0) for cat in self.categories])
+    def _compute_metrics(self, method_result: MethodResult, scheme: str) -> BenchmarkMetrics:
+        """Compute evaluation metrics for a method under a chosen category scheme."""
+        cats_gt, true_probs = self._align_ground_truth(scheme)
+        cats_est, est_probs, _ = self._align(method_result.estimates, method_result.confidence_intervals, scheme)
+        # Sanity: ensure same order
+        if cats_gt != cats_est:
+            raise RuntimeError("Internal mismatch in category alignment")
         
         # Basic distance metrics
         l1_distance = np.sum(np.abs(true_probs - est_probs))
@@ -205,7 +300,7 @@ class LabelShiftBenchmark:
         
         # Relative errors (avoid division by zero)
         rel_errors = {}
-        for i, cat in enumerate(self.categories):
+        for i, cat in enumerate(cats_gt):
             if true_probs[i] > 0:
                 rel_errors[cat] = abs_errors[i] / true_probs[i]
             else:
@@ -217,15 +312,18 @@ class LabelShiftBenchmark:
         if method_result.confidence_intervals:
             coverage_count = 0
             widths = {}
-            for i, cat in enumerate(self.categories):
-                if cat in method_result.confidence_intervals:
-                    ci_lo, ci_hi = method_result.confidence_intervals[cat]
+            cats_ci, _, cis_aligned = self._align(method_result.estimates, method_result.confidence_intervals, scheme)
+            if cats_ci != cats_gt:
+                raise RuntimeError("Internal mismatch in CI alignment")
+            for i, cat in enumerate(cats_gt):
+                if cis_aligned and cat in cis_aligned:
+                    ci_lo, ci_hi = cis_aligned[cat]
                     if ci_lo <= true_probs[i] <= ci_hi:
                         coverage_count += 1
                     widths[cat] = ci_hi - ci_lo
                 else:
                     widths[cat] = 0.0
-            coverage_rate = coverage_count / len(self.categories)
+            coverage_rate = coverage_count / len(cats_gt)
             interval_widths = widths
         
         return BenchmarkMetrics(
@@ -240,164 +338,170 @@ class LabelShiftBenchmark:
         )
     
     def compare_methods(self, results_dirs: List[str]) -> pd.DataFrame:
-        """Compare multiple methods and return summary table"""
-        results = []
-        
-        for results_dir in results_dirs:
+        """Compare multiple methods and return summary table (adaptive 6/7-class)."""
+        loaded: List[MethodResult] = []
+        for d in results_dirs:
             try:
-                method_result, metrics = self.evaluate_method(results_dir)
-                
+                loaded.append(self._load_method_results(d))
+            except Exception as e:
+                print(f"Warning: Failed to load {d}: {e}")
+        scheme = self._decide_scheme_for_methods(loaded)
+
+        results = []
+        for mr in loaded:
+            try:
+                metrics = self._compute_metrics(mr, scheme)
                 row = {
-                    'Method': method_result.name,
+                    'Method': mr.name,
                     'L1 Distance': f"{metrics.l1_distance:.4f}",
                     'L2 Distance': f"{metrics.l2_distance:.4f}",
                     'KL Divergence': f"{metrics.kl_divergence:.4f}",
                     'Max Abs Error': f"{metrics.max_absolute_error:.4f}",
                     'Mean Abs Error': f"{metrics.mean_absolute_error:.4f}",
                 }
-                
                 if metrics.coverage_rate is not None:
                     row['CI Coverage'] = f"{metrics.coverage_rate:.2%}"
                     avg_width = np.mean(list(metrics.interval_widths.values()))
                     row['Avg CI Width'] = f"{avg_width:.4f}"
-                
                 results.append(row)
-                
             except Exception as e:
-                print(f"Warning: Failed to evaluate {results_dir}: {e}")
+                print(f"Warning: Failed to evaluate {mr.name}: {e}")
                 continue
-        
         return pd.DataFrame(results)
     
     def plot_comparison(self, results_dirs: List[str], output_path: str = "benchmark_comparison.png"):
-        """Create comprehensive comparison plots"""
-        methods_data = []
-        
-        for results_dir in results_dirs:
+        """Create comprehensive comparison plots with adaptive 6/7-class alignment."""
+        methods: List[MethodResult] = []
+        for d in results_dirs:
             try:
-                method_result, metrics = self.evaluate_method(results_dir)
-                methods_data.append((method_result, metrics))
+                methods.append(self._load_method_results(d))
             except Exception as e:
-                print(f"Warning: Failed to load {results_dir}: {e}")
-                continue
-        
-        if not methods_data:
+                print(f"Warning: Failed to load {d}: {e}")
+        if not methods:
             print("No valid methods to plot")
             return
-        
-        # Create subplot layout
+
+        scheme = self._decide_scheme_for_methods(methods)
+        cats, gt_arr = self._align_ground_truth(scheme)
+
+        aligned = []
+        for m in methods:
+            cats_m, est_arr, cis_m = self._align(m.estimates, m.confidence_intervals, scheme)
+            if cats_m != cats:
+                print(f"Warning: Category mismatch for {m.name}; skipping")
+                continue
+            aligned.append((m, est_arr, cis_m))
+        if not aligned:
+            print("No aligned methods to plot")
+            return
+
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle('Label-Shift Estimation Methods Comparison', fontsize=16)
-        
-        # Plot 1: Estimates vs Ground Truth
+
+        # Plot 1
         ax1 = axes[0, 0]
-        x = np.arange(len(self.categories))
-        width = 0.8 / (len(methods_data) + 1)
-        
-        # Ground truth bars
-        true_probs = [self.ground_truth[cat] for cat in self.categories]
-        ax1.bar(x - width * len(methods_data)/2, true_probs, width, 
+        x = np.arange(len(cats))
+        width = 0.8 / (len(aligned) + 1)
+        ax1.bar(x - width * len(aligned)/2, gt_arr.tolist(), width,
                 label='Ground Truth', color='black', alpha=0.7)
-        
-        # Method estimates
-        colors = plt.cm.Set3(np.linspace(0, 1, len(methods_data)))
-        for i, (method_result, _) in enumerate(methods_data):
-            est_probs = [method_result.estimates.get(cat, 0.0) for cat in self.categories]
-            ax1.bar(x - width * len(methods_data)/2 + width * (i+1), est_probs, width,
-                   label=method_result.name, color=colors[i], alpha=0.8)
-            
-            # Add confidence intervals if available
-            if method_result.confidence_intervals:
-                cis = [method_result.confidence_intervals.get(cat, (0, 0)) for cat in self.categories]
-                yerr = [(est - ci[0], ci[1] - est) for est, ci in zip(est_probs, cis)]
+        colors = plt.cm.Set3(np.linspace(0, 1, len(aligned)))
+        for i, (m, est_arr, cis_m) in enumerate(aligned):
+            vals = est_arr.tolist()
+            ax1.bar(x - width * len(aligned)/2 + width * (i+1), vals, width,
+                    label=m.name, color=colors[i], alpha=0.8)
+            if cis_m:
+                cis = [cis_m.get(cat, (0, 0)) for cat in cats]
+                yerr = [(v - ci[0], ci[1] - v) for v, ci in zip(vals, cis)]
                 yerr = np.array(yerr).T
-                ax1.errorbar(x - width * len(methods_data)/2 + width * (i+1), est_probs, 
-                           yerr=yerr, fmt='none', color='black', capsize=3, alpha=0.6)
-        
+                ax1.errorbar(x - width * len(aligned)/2 + width * (i+1), vals,
+                             yerr=yerr, fmt='none', color='black', capsize=3, alpha=0.6)
         ax1.set_xlabel('Categories')
         ax1.set_ylabel('Proportion')
         ax1.set_title('Estimated vs Ground Truth Proportions')
         ax1.set_xticks(x)
-        ax1.set_xticklabels(self.categories, rotation=45, ha='right')
+        ax1.set_xticklabels(cats, rotation=45, ha='right')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Error by Category
+
+        # Plot 2
         ax2 = axes[0, 1]
-        for i, (method_result, metrics) in enumerate(methods_data):
-            errors = [abs(method_result.estimates.get(cat, 0.0) - self.ground_truth[cat]) 
-                     for cat in self.categories]
-            ax2.plot(range(len(self.categories)), errors, 'o-', 
-                    label=method_result.name, color=colors[i])
-        
+        for i, (m, est_arr, _) in enumerate(aligned):
+            errors = np.abs(est_arr - gt_arr)
+            ax2.plot(range(len(cats)), errors, 'o-', label=m.name, color=colors[i])
         ax2.set_xlabel('Categories')
         ax2.set_ylabel('Absolute Error')
         ax2.set_title('Absolute Error by Category')
-        ax2.set_xticks(range(len(self.categories)))
-        ax2.set_xticklabels(self.categories, rotation=45, ha='right')
+        ax2.set_xticks(range(len(cats)))
+        ax2.set_xticklabels(cats, rotation=45, ha='right')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-        
-        # Plot 3: Overall Metrics Comparison
+
+        # Plot 3
         ax3 = axes[1, 0]
         metrics_names = ['L1 Distance', 'L2 Distance', 'Mean Abs Error', 'Max Abs Error']
         metrics_data = []
         method_names = []
-        
-        for method_result, metrics in methods_data:
-            method_names.append(method_result.name)
-            metrics_data.append([
-                metrics.l1_distance,
-                metrics.l2_distance, 
-                metrics.mean_absolute_error,
-                metrics.max_absolute_error
-            ])
-        
+        for m, _, _ in aligned:
+            met = self._compute_metrics(m, scheme)
+            method_names.append(m.name)
+            metrics_data.append([met.l1_distance, met.l2_distance, met.mean_absolute_error, met.max_absolute_error])
         metrics_df = pd.DataFrame(metrics_data, columns=metrics_names, index=method_names)
         sns.heatmap(metrics_df, annot=True, fmt='.4f', cmap='Reds', ax=ax3)
         ax3.set_title('Error Metrics Heatmap')
-        
-        # Plot 4: Relative Errors
+
+        # Plot 4
         ax4 = axes[1, 1]
-        for i, (method_result, metrics) in enumerate(methods_data):
-            rel_errors = [metrics.relative_errors.get(cat, 0) for cat in self.categories]
-            # Cap relative errors for visualization
-            rel_errors = [min(err, 5.0) if err != float('inf') else 5.0 for err in rel_errors]
-            ax4.bar(x + width * i, rel_errors, width, 
-                   label=method_result.name, color=colors[i], alpha=0.8)
-        
-        ax4.set_xlabel('Categories')
-        ax4.set_ylabel('Relative Error (capped at 5.0)')
-        ax4.set_title('Relative Error by Category')
-        ax4.set_xticks(x + width * (len(methods_data)-1) / 2)
-        ax4.set_xticklabels(self.categories, rotation=45, ha='right')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-        
+        has_ci = any(m.confidence_intervals is not None for m, _, _ in aligned)
+        if has_ci:
+            coverages = []
+            names = []
+            for m, _, _ in aligned:
+                met = self._compute_metrics(m, scheme)
+                if met.coverage_rate is not None:
+                    coverages.append(met.coverage_rate)
+                    names.append(m.name)
+            if coverages:
+                ax4.bar(names, coverages)
+                ax4.set_ylim(0, 1)
+                ax4.set_ylabel('CI Coverage')
+                ax4.set_title('Confidence Interval Coverage')
+                ax4.tick_params(axis='x', rotation=45)
+        else:
+            ax4.axis('off')
+
         plt.tight_layout()
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Comparison plot saved to {output_path}")
     
     def generate_report(self, results_dirs: List[str], output_file: str = "benchmark_report.md"):
-        """Generate a comprehensive markdown report"""
+        """Generate a comprehensive markdown report (adaptive 6/7-class)."""
         report_lines = [
             "# Label-Shift Estimation Benchmark Report",
             "",
             f"**Ground Truth Model**: {Path(self.ground_truth_file).stem}",
-            f"**Categories**: {', '.join(self.categories)}",
             "",
             "## Ground Truth Proportions",
             "",
         ]
-        
+
+        # Load methods to choose scheme
+        methods: List[MethodResult] = []
+        for d in results_dirs:
+            try:
+                methods.append(self._load_method_results(d))
+            except Exception as e:
+                report_lines.append(f"- Failed to load {Path(d).name}: {e}")
+        scheme = self._decide_scheme_for_methods(methods) if methods else '7-class'
+        cats, gt_arr = self._align_ground_truth(scheme)
+
         # Ground truth table
         report_lines.append("| Category | Proportion |")
         report_lines.append("|----------|------------|")
-        for cat in self.categories:
-            report_lines.append(f"| {cat} | {self.ground_truth[cat]:.4f} |")
+        for c, v in zip(cats, gt_arr):
+            report_lines.append(f"| {c} | {v:.4f} |")
         report_lines.append("")
-        
+
         # Method comparison table
         comparison_df = self.compare_methods(results_dirs)
         if not comparison_df.empty:
@@ -405,40 +509,36 @@ class LabelShiftBenchmark:
             report_lines.append("")
             report_lines.append(comparison_df.to_markdown(index=False))
             report_lines.append("")
-        
-        # Detailed results for each method
+
+        # Detailed results
         report_lines.append("## Detailed Results")
         report_lines.append("")
-        
-        for results_dir in results_dirs:
+        for d in results_dirs:
             try:
-                method_result, metrics = self.evaluate_method(results_dir)
-                
+                m = self._load_method_results(d)
+                metrics = self._compute_metrics(m, scheme)
+                cats_eval, est_arr, cis_aligned = self._align(m.estimates, m.confidence_intervals, scheme)
+                if cats_eval != cats:
+                    raise RuntimeError("Category mismatch in report alignment")
                 report_lines.extend([
-                    f"### {method_result.name}",
+                    f"### {m.name}",
                     "",
                     "**Estimates vs Ground Truth:**",
                     "",
                     "| Category | Estimate | Ground Truth | Absolute Error | Relative Error |",
                     "|----------|----------|--------------|----------------|----------------|"
                 ])
-                
-                for cat in self.categories:
-                    est = method_result.estimates.get(cat, 0.0)
-                    true_val = self.ground_truth[cat]
+                for i, c in enumerate(cats):
+                    est = float(est_arr[i])
+                    true_val = float(gt_arr[i])
                     abs_err = abs(est - true_val)
-                    rel_err = metrics.relative_errors[cat]
+                    rel_err = metrics.relative_errors[c]
                     rel_err_str = f"{rel_err:.2%}" if rel_err != float('inf') else "∞"
-                    
                     ci_str = ""
-                    if method_result.confidence_intervals and cat in method_result.confidence_intervals:
-                        ci_lo, ci_hi = method_result.confidence_intervals[cat]
-                        ci_str = f" [{ci_lo:.4f}, {ci_hi:.4f}]"
-                    
-                    report_lines.append(
-                        f"| {cat} | {est:.4f}{ci_str} | {true_val:.4f} | {abs_err:.4f} | {rel_err_str} |"
-                    )
-                
+                    if cis_aligned and c in cis_aligned:
+                        lo, hi = cis_aligned[c]
+                        ci_str = f" [{lo:.4f}, {hi:.4f}]"
+                    report_lines.append(f"| {c} | {est:.4f}{ci_str} | {true_val:.4f} | {abs_err:.4f} | {rel_err_str} |")
                 report_lines.extend([
                     "",
                     "**Summary Metrics:**",
@@ -448,25 +548,20 @@ class LabelShiftBenchmark:
                     f"- Mean Absolute Error: {metrics.mean_absolute_error:.4f}",
                     f"- Max Absolute Error: {metrics.max_absolute_error:.4f}",
                 ])
-                
                 if metrics.coverage_rate is not None:
                     report_lines.append(f"- Confidence Interval Coverage: {metrics.coverage_rate:.2%}")
                     avg_width = np.mean(list(metrics.interval_widths.values()))
                     report_lines.append(f"- Average CI Width: {avg_width:.4f}")
-                
                 report_lines.append("")
-                
             except Exception as e:
                 report_lines.extend([
-                    f"### {Path(results_dir).name} (Failed)",
+                    f"### {Path(d).name} (Failed)",
                     f"Error: {e}",
                     ""
                 ])
-        
-        # Write report
+
         with open(output_file, 'w') as f:
             f.write('\n'.join(report_lines))
-        
         print(f"Benchmark report saved to {output_file}")
 
 
