@@ -204,6 +204,45 @@ class HFSequenceClassifier:
         probs = _softmax(z / float(self.temperature), axis=1)
         return probs
 
+    def embeddings(self, X: List[str], batch_size: int = 32) -> np.ndarray:
+        """
+        Return mean-pooled token embeddings from the last hidden layer for each input.
+        Shape: [N, hidden_size]. Uses attention mask to average only over non-pad tokens.
+        """
+        assert _HF_AVAILABLE, "HuggingFace transformers/torch not available"
+        mdl = self.model
+        tok = self.tokenizer
+        device = self.device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        mdl.eval()
+        mdl.to(device)
+        ds = _TextClsDataset(X, None, tok, self.max_length)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=self._collate)
+        outs = []
+        with torch.no_grad():
+            for batch in dl:
+                am = batch.get("attention_mask")
+                batch = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+                out = mdl(**batch, output_hidden_states=True)
+                # last hidden state [B, T, H]
+                if hasattr(out, "hidden_states") and out.hidden_states is not None:
+                    h = out.hidden_states[-1]
+                else:
+                    # Fallback: some heads return tuple
+                    h = out[1] if len(out) > 1 else out[0]
+                # Mean-pool over tokens using attention mask
+                if am is None:
+                    am = torch.ones(h.shape[:2], dtype=torch.long, device=h.device)
+                else:
+                    am = am.to(h.device)
+                am = am.float()
+                am = am.unsqueeze(-1)  # [B, T, 1]
+                masked = h * am
+                denom = torch.clamp(am.sum(dim=1), min=1e-6)  # [B,1]
+                pooled = masked.sum(dim=1) / denom
+                outs.append(pooled.detach().cpu())
+        E = torch.cat(outs, dim=0).numpy() if outs else np.zeros((0, getattr(mdl.config, 'hidden_size', 768)), dtype=np.float32)
+        return E
+
     @staticmethod
     def _collate(batch: List[Dict]):
         # Dynamic padding collator

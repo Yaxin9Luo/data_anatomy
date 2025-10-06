@@ -10,10 +10,19 @@ def project_to_simplex(v: np.ndarray) -> np.ndarray:
     """
     if v.ndim != 1:
         raise ValueError("v must be 1D")
+    # Sanitize non-finite values to avoid NaN propagation
+    v = np.asarray(v, dtype=float)
+    if not np.all(np.isfinite(v)):
+        v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
     n = v.shape[0]
     u = np.sort(v)[::-1]
     cssv = np.cumsum(u)
-    rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - 1))[0][-1]
+    mask = u * np.arange(1, n + 1) > (cssv - 1)
+    idxs = np.nonzero(mask)[0]
+    if idxs.size == 0:
+        # Degenerate case (e.g., all zeros): return uniform
+        return np.ones(n, dtype=float) / float(n)
+    rho = idxs[-1]
     theta = (cssv[rho] - 1) / (rho + 1)
     w = np.maximum(v - theta, 0)
     # Handle degenerate all-zeros
@@ -60,4 +69,3 @@ def bootstrap_priors(
     lo = np.percentile(P, 2.5, axis=0)
     hi = np.percentile(P, 97.5, axis=0)
     return pi_mean, lo, hi
-

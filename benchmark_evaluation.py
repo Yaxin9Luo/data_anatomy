@@ -318,9 +318,11 @@ class LabelShiftBenchmark:
             for i, cat in enumerate(cats_gt):
                 if cis_aligned and cat in cis_aligned:
                     ci_lo, ci_hi = cis_aligned[cat]
-                    if ci_lo <= true_probs[i] <= ci_hi:
+                    lo = float(min(ci_lo, ci_hi))
+                    hi = float(max(ci_lo, ci_hi))
+                    if lo <= true_probs[i] <= hi:
                         coverage_count += 1
-                    widths[cat] = ci_hi - ci_lo
+                    widths[cat] = max(0.0, hi - lo)
                 else:
                     widths[cat] = 0.0
             coverage_rate = coverage_count / len(cats_gt)
@@ -395,84 +397,86 @@ class LabelShiftBenchmark:
             print("No aligned methods to plot")
             return
 
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Label-Shift Estimation Methods Comparison', fontsize=16)
-
-        # Plot 1
-        ax1 = axes[0, 0]
+        # Figure 1: Estimated vs Ground Truth (bar chart)
+        fig_width = max(16, min(48, 0.35 * len(cats)))
+        plt.figure(figsize=(fig_width, 6))
         x = np.arange(len(cats))
         width = 0.8 / (len(aligned) + 1)
-        ax1.bar(x - width * len(aligned)/2, gt_arr.tolist(), width,
+        plt.bar(x - width * len(aligned)/2, gt_arr.tolist(), width,
                 label='Ground Truth', color='black', alpha=0.7)
         colors = plt.cm.Set3(np.linspace(0, 1, len(aligned)))
         for i, (m, est_arr, cis_m) in enumerate(aligned):
             vals = est_arr.tolist()
-            ax1.bar(x - width * len(aligned)/2 + width * (i+1), vals, width,
+            plt.bar(x - width * len(aligned)/2 + width * (i+1), vals, width,
                     label=m.name, color=colors[i], alpha=0.8)
             if cis_m:
-                cis = [cis_m.get(cat, (0, 0)) for cat in cats]
-                yerr = [(v - ci[0], ci[1] - v) for v, ci in zip(vals, cis)]
-                yerr = np.array(yerr).T
-                ax1.errorbar(x - width * len(aligned)/2 + width * (i+1), vals,
+                cis = [cis_m.get(cat, (0.0, 0.0)) for cat in cats]
+                lower = []
+                upper = []
+                for v, ci in zip(vals, cis):
+                    lo, hi = float(min(ci[0], ci[1])), float(max(ci[0], ci[1]))
+                    lower.append(max(0.0, v - lo))
+                    upper.append(max(0.0, hi - v))
+                yerr = np.vstack([lower, upper])
+                plt.errorbar(x - width * len(aligned)/2 + width * (i+1), vals,
                              yerr=yerr, fmt='none', color='black', capsize=3, alpha=0.6)
-        ax1.set_xlabel('Categories')
-        ax1.set_ylabel('Proportion')
-        ax1.set_title('Estimated vs Ground Truth Proportions')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(cats, rotation=45, ha='right')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        # Plot 2
-        ax2 = axes[0, 1]
-        for i, (m, est_arr, _) in enumerate(aligned):
-            errors = np.abs(est_arr - gt_arr)
-            ax2.plot(range(len(cats)), errors, 'o-', label=m.name, color=colors[i])
-        ax2.set_xlabel('Categories')
-        ax2.set_ylabel('Absolute Error')
-        ax2.set_title('Absolute Error by Category')
-        ax2.set_xticks(range(len(cats)))
-        ax2.set_xticklabels(cats, rotation=45, ha='right')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # Plot 3
-        ax3 = axes[1, 0]
-        metrics_names = ['L1 Distance', 'L2 Distance', 'Mean Abs Error', 'Max Abs Error']
-        metrics_data = []
-        method_names = []
-        for m, _, _ in aligned:
-            met = self._compute_metrics(m, scheme)
-            method_names.append(m.name)
-            metrics_data.append([met.l1_distance, met.l2_distance, met.mean_absolute_error, met.max_absolute_error])
-        metrics_df = pd.DataFrame(metrics_data, columns=metrics_names, index=method_names)
-        sns.heatmap(metrics_df, annot=True, fmt='.4f', cmap='Reds', ax=ax3)
-        ax3.set_title('Error Metrics Heatmap')
-
-        # Plot 4
-        ax4 = axes[1, 1]
-        has_ci = any(m.confidence_intervals is not None for m, _, _ in aligned)
-        if has_ci:
-            coverages = []
-            names = []
-            for m, _, _ in aligned:
-                met = self._compute_metrics(m, scheme)
-                if met.coverage_rate is not None:
-                    coverages.append(met.coverage_rate)
-                    names.append(m.name)
-            if coverages:
-                ax4.bar(names, coverages)
-                ax4.set_ylim(0, 1)
-                ax4.set_ylabel('CI Coverage')
-                ax4.set_title('Confidence Interval Coverage')
-                ax4.tick_params(axis='x', rotation=45)
-        else:
-            ax4.axis('off')
-
+        plt.xlabel('Categories')
+        plt.ylabel('Proportion')
+        plt.title('Estimated vs Ground Truth Proportions')
+        # Show all categories on the x-axis
+        plt.xticks(x, cats, rotation=45, ha='right')
+        plt.tick_params(axis='x', labelsize=7)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Comparison plot saved to {output_path}")
+
+        # Figure 2: Absolute Error by Category (line plot)
+        plt.figure(figsize=(fig_width, 5))
+        for i, (m, est_arr, _) in enumerate(aligned):
+            errors = np.abs(est_arr - gt_arr)
+            plt.plot(range(len(cats)), errors, 'o-', label=m.name, color=colors[i])
+        plt.xlabel('Categories')
+        plt.ylabel('Absolute Error')
+        plt.title('Absolute Error by Category')
+        # Show all categories on the x-axis
+        plt.xticks(range(len(cats)), cats, rotation=45, ha='right')
+        plt.tick_params(axis='x', labelsize=7)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out_errors = output_path.replace('.png', '_errors.png')
+        plt.savefig(out_errors, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Absolute error plot saved to {out_errors}")
+
+        # Additionally, save a zoomed-in plot on top-K categories by ground truth proportion
+        try:
+            top_k = min(20, len(cats))
+            idx_sorted = np.argsort(gt_arr)[-top_k:][::-1]
+            cats_top = [cats[i] for i in idx_sorted]
+            gt_top = gt_arr[idx_sorted]
+            xt = np.arange(len(cats_top))
+            width = 0.8 / (len(aligned) + 1)
+            plt.figure(figsize=(max(12, 0.6 * top_k), 5))
+            plt.bar(xt - width * len(aligned)/2, gt_top.tolist(), width, label='Ground Truth', color='black', alpha=0.7)
+            colors = plt.cm.Set3(np.linspace(0, 1, len(aligned)))
+            for i, (m, est_arr, cis_m) in enumerate(aligned):
+                vals = est_arr[idx_sorted].tolist()
+                plt.bar(xt - width * len(aligned)/2 + width * (i+1), vals, width, label=m.name, color=colors[i], alpha=0.8)
+            plt.xticks(xt, cats_top, rotation=45, ha='right')
+            plt.ylabel('Proportion')
+            plt.title(f'Estimated vs Ground Truth (Top {top_k} Categories)')
+            plt.legend()
+            plt.tight_layout()
+            out_top = output_path.replace('.png', f'_top{top_k}.png')
+            plt.savefig(out_top, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"Top-{top_k} comparison plot saved to {out_top}")
+        except Exception as e:
+            print(f"Warning: failed to save top-K zoomed plot: {e}")
     
     def generate_report(self, results_dirs: List[str], output_file: str = "benchmark_report.md"):
         """Generate a comprehensive markdown report (adaptive 6/7-class)."""

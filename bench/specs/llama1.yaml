@@ -1,7 +1,7 @@
 schema: category-mixture-v1
 name: Llama 1
 family: Meta Llama 1
-tokenizer_name: huggyllama/llama-7b
+tokenizer_name: huggyllama/llama-65b
 categories:
   - CommonCrawl
   - C4

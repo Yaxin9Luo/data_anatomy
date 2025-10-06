@@ -122,15 +122,44 @@ CATEGORY_STYLE_PROMPTS = {
     ],
 }
 
-def load_hf_model(model_name: str):
-    tok = AutoTokenizer.from_pretrained(model_name)
+
+def load_hf_model(model_name: str, revision: Optional[str] = None):
+    tok = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        padding_side="left",
+        revision=revision,
+    )
+
     # Ensure a valid pad token for batch padding with causal LMs (e.g., LLaMA)
     if tok.pad_token is None:
         if tok.eos_token is not None:
             tok.pad_token = tok.eos_token
         else:
             tok.add_special_tokens({"pad_token": "<|pad|>"})
-    mdl = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
+            tok.pad_token = "<|pad|>"
+    tok.padding_side = "left"
+    tok.truncation_side = "left"
+    
+    # Try loading on a single GPU first, fallback to device_map="auto" if OOM
+    try:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="cuda:0",
+            trust_remote_code=True,
+            revision=revision,
+        )
+    except torch.cuda.OutOfMemoryError:
+        print("OOM on single GPU, using device_map='auto'")
+        mdl = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+            revision=revision,
+        )
+    
     # If we added tokens, resize embeddings
     if hasattr(mdl, "get_input_embeddings") and hasattr(mdl, "resize_token_embeddings"):
         vocab_size = mdl.get_input_embeddings().weight.shape[0]
@@ -141,6 +170,18 @@ def load_hf_model(model_name: str):
         mdl.config.pad_token_id = tok.pad_token_id
     except Exception:
         pass
+    try:
+        mdl.generation_config.pad_token_id = tok.pad_token_id
+    except Exception:
+        pass
+    if tok.eos_token_id is not None:
+        try:
+            mdl.generation_config.eos_token_id = tok.eos_token_id
+        except Exception:
+            try:
+                mdl.config.eos_token_id = tok.eos_token_id
+            except Exception:
+                pass
     mdl.eval()
     return mdl, tok
 
@@ -152,24 +193,86 @@ def generate_texts(
     temperature: float = 0.8,
     top_p: float = 0.9,
     batch_size: int = 4,
+    revision: Optional[str] = None,
 ) -> List[str]:
-    prompts = prompts or DEFAULT_PROMPTS
-    model, tok = load_hf_model(model_name)
+    prompts = prompts or NEUTRAL_PROMPTS
+    if not prompts:
+        raise ValueError("No prompts provided for generation")
+    model, tok = load_hf_model(model_name, revision=revision)
 
     out_texts: List[str] = []
-    device = next(model.parameters()).device
+    
+    # Determine the device strategy
+    if hasattr(model, 'hf_device_map') and model.hf_device_map:
+        # Model is distributed across devices, need to move inputs to first device
+        candidate_devices = []
+        for dev in model.hf_device_map.values():
+            if isinstance(dev, torch.device):
+                if dev.type != "meta":
+                    candidate_devices.append(dev)
+            elif isinstance(dev, str):
+                if dev.startswith("cuda") or dev.startswith("cpu"):
+                    candidate_devices.append(torch.device(dev))
+            elif isinstance(dev, int):
+                candidate_devices.append(torch.device(f"cuda:{dev}"))
+        if not candidate_devices:
+            candidate_devices.append(torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
+        # Prefer CUDA if available in the map
+        def _device_key(dev: torch.device) -> tuple:
+            if dev.type == "cuda":
+                # Prefer lower index CUDA devices first
+                return (0, dev.index or 0)
+            if dev.type == "cpu":
+                return (1, 0)
+            return (2, 0)
+
+        candidate_devices.sort(key=_device_key)
+        first_device = candidate_devices[0]
+        use_device_map = True
+    else:
+        # Model is on a single device
+        first_device = next(model.parameters()).device
+        use_device_map = False
+    
     for i in tqdm(range(0, len(prompts), batch_size), total=(len(prompts)+batch_size-1)//batch_size, desc="Generating"):
         batch = prompts[i : i + batch_size]
-        enc = tok(batch, return_tensors="pt", padding=True).to(device)
+        enc = tok(batch, return_tensors="pt", padding=True)
+        # Remove token_type_ids if present, as some models (like OLMo) don't use them
+        if "token_type_ids" in enc:
+            enc.pop("token_type_ids")
+        
+        # Move inputs to the appropriate device
+        if use_device_map:
+            # For distributed models, move to the primary device (Accelerate handles sharding)
+            enc = enc.to(first_device)
+        else:
+            # For single-device models, move to model's device
+            enc = enc.to(first_device)
+            
         with torch.no_grad():
-            gen = model.generate(
-                **enc,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
-            )
+            try:
+                gen = model.generate(
+                    **enc,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
+                )
+            except Exception as e:
+                msg = str(e)
+                # Known issue: some OLMo/hf_olmo revisions error on None past_key_values.
+                # Fallback: retry with use_cache=False and hint about pinning revision.
+                print(f"Generation error: {e}\nRetrying with use_cache=False. Consider pinning --hf_revision to a known-good checkpoint.")
+                gen = model.generate(
+                    **enc,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
+                    use_cache=False,
+                )
         texts = tok.batch_decode(gen, skip_special_tokens=True)
         # Strip the original prompt to keep only generations after the prompt
         for p, full in zip(batch, texts):

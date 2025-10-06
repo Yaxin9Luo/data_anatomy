@@ -97,6 +97,18 @@ def detect_available_categories(local_dir: str, merge_web: bool = True) -> Tuple
     Returns (categories, file_to_cat_map)
     """
     files = set(os.listdir(local_dir)) if os.path.isdir(local_dir) else set()
+
+    def _generic_mapping(src_files: set[str]) -> Tuple[List[str], Dict[str, str]]:
+        mapping: Dict[str, str] = {}
+        for fname in sorted(src_files):
+            if not fname.lower().endswith(".jsonl"):
+                continue
+            stem = os.path.splitext(fname)[0]
+            if not stem:
+                continue
+            mapping[fname] = stem
+        cats = list(dict.fromkeys(mapping.values()))
+        return cats, mapping
     if merge_web:
         # Prefer a single explicit merged web file if available. Always include other categories.
         mapping: Dict[str, str] = {}
@@ -115,8 +127,14 @@ def detect_available_categories(local_dir: str, merge_web: bool = True) -> Tuple
         else:
             # Fall back to pooling C4 + CommonCrawl implicitly by including both raw files
             mapping = {k: v for k, v in DEFAULT_FILE_TO_CAT_6.items() if k in files}
-        cats = sorted(set(mapping.values()), key=lambda c: CATEGORIES_6.index(c))
-        return cats, mapping
+        if mapping:
+            cats = sorted(
+                set(mapping.values()),
+                key=lambda c: (0, CATEGORIES_6.index(c)) if c in CATEGORIES_6 else (1, c),
+            )
+            return cats, mapping
+        # Fallback: treat each *.jsonl file as its own category
+        return _generic_mapping(files)
     else:
         # Prefer split mapping; if not fully available, fall back gracefully
         mapping7 = {k: v for k, v in DEFAULT_FILE_TO_CAT_7.items() if k in files}
@@ -131,8 +149,16 @@ def detect_available_categories(local_dir: str, merge_web: bool = True) -> Tuple
                 # If only one of c4/commoncrawl exists, we will still proceed with partial split
                 pass
         # Compute final category order
-        cats_present = sorted(set(mapping7.values()), key=lambda c: (CATEGORIES_7 + ["Web"]).index(c))
-        return cats_present, mapping7
+        if mapping7:
+            cats_present = sorted(
+                set(mapping7.values()),
+                key=lambda c: (0, (CATEGORIES_7 + ["Web"]).index(c))
+                if c in (CATEGORIES_7 + ["Web"])
+                else (1, c),
+            )
+            return cats_present, mapping7
+        # Fallback for arbitrary categories
+        return _generic_mapping(files)
 
 
 @dataclass
