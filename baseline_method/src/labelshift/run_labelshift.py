@@ -11,6 +11,16 @@ from classifier import train_tfidf_classifier, train_distilbert_classifier
 from generate import generate_texts, NEUTRAL_PROMPTS
 from prior import estimate_priors_least_squares, bootstrap_priors
 from viz import plot_confusion_matrix, plot_priors_with_ci, plot_pbar_vs_ctpi
+from inspect_viz import (
+    plot_assignment_sankey,
+    write_assignment_gallery_html_train_val,
+    write_assignment_gallery_html_generated,
+    nn_composition_and_diagnostics,
+    distance_diagnostics,
+    plot_embeddings_map,
+    class_prototypes_and_medoids,
+)
+from sklearn.metrics import confusion_matrix
 from sklearn.neighbors import NearestNeighbors
 import csv
 
@@ -279,19 +289,44 @@ def main() -> None:
                         txt[: args.snippet_len].replace("\n", " ")
                     ])
 
+            # Sankey diagram from true (val) -> predicted (val)
+            try:
+                cm_counts = confusion_matrix(ds.val.labels, val_pred)
+                plot_assignment_sankey(cm_counts, ds.categories, str(out_dir / "sankey_val_true_pred.png"))
+            except Exception as e:
+                print(f"Inspector: failed to plot Sankey: {e}")
+
+            # HTML gallery for train/val assignments
+            try:
+                write_assignment_gallery_html_train_val(str(tv_path), str(out_dir / "gallery_train_val.html"))
+            except Exception as e:
+                print(f"Inspector: failed to write train/val gallery: {e}")
+
             # Generated predictions
             gen_path = out_dir / "generated_predictions.csv"
             with open(gen_path, "w", encoding="utf-8", newline="") as fcsv:
                 writer = csv.writer(fcsv)
-                writer.writerow(["gen_index", "pred_class", "top1_conf", "top3", "text_snippet"])
+                # If prompts variable exists in scope, we will include prompt metadata; else leave blank
+                have_prompts = 'prompts' in locals()
+                writer.writerow(["gen_index", "prompt_id", "pred_class", "top1_conf", "top3", "prompt", "text_snippet"])
                 for i, (pp, txt) in enumerate(zip(probs, gen_texts)):
+                    pr_idx = i if have_prompts else ""
+                    pr_text = (prompts[i] if have_prompts and i < len(prompts) else "")
                     writer.writerow([
                         i,
+                        pr_idx,
                         ds.categories[int(np.argmax(pp))],
                         f"{float(np.max(pp)):.3f}",
                         "|".join(_topk_info(pp, ds.categories)),
+                        str(pr_text).replace("\n", " "),
                         txt[: args.snippet_len].replace("\n", " ")
                     ])
+
+            # HTML gallery for generated assignments
+            try:
+                write_assignment_gallery_html_generated(str(gen_path), str(out_dir / "gallery_generated.html"))
+            except Exception as e:
+                print(f"Inspector: failed to write generated gallery: {e}")
 
             # Nearest neighbors (DistilBERT only)
             # Guard: embeddings available only for HFSequenceClassifier
@@ -300,6 +335,11 @@ def main() -> None:
                 train_emb = model.embeddings(ds.train.texts, batch_size=max(8, bs))
                 nn = NearestNeighbors(n_neighbors=max(1, args.nn_k), metric="cosine", algorithm="brute")
                 nn.fit(train_emb)
+                # Validation embeddings
+                try:
+                    val_emb = model.embeddings(ds.val.texts, batch_size=max(8, bs))
+                except Exception:
+                    val_emb = None
                 # Gen subset
                 m = min(max(1, args.nn_max_gens), len(gen_texts))
                 sub_gen_texts = gen_texts[:m]
@@ -329,6 +369,48 @@ def main() -> None:
                                 "text_snippet": ds.train.texts[ti][: args.snippet_len]
                             })
                         fj.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+
+                # NN composition (per-sample + aggregated), hubness
+                try:
+                    nn_composition_and_diagnostics(
+                        str(neigh_path), out_dir=str(out_dir), categories=ds.categories,
+                    )
+                except Exception as e:
+                    print(f"Inspector: NN composition failed: {e}")
+
+                # Distance diagnostics plot (uses kNN set)
+                try:
+                    gen_pred_sub = np.argmax(probs[:m], axis=1).tolist()
+                    distance_diagnostics(gen_pred_sub, (dists, nbrs), ds.train.labels, ds.categories, str(out_dir / "nn_distance_diagnostics.png"))
+                except Exception as e:
+                    print(f"Inspector: distance diagnostics failed: {e}")
+
+                # Embedding map (t-SNE) across splits
+                try:
+                    plot_embeddings_map(
+                        train_emb=train_emb,
+                        train_labels=ds.train.labels,
+                        val_emb=(val_emb if val_emb is not None else np.zeros((0, train_emb.shape[1]))),
+                        val_labels=(ds.val.labels if val_emb is not None else []),
+                        gen_emb=gen_emb,
+                        gen_pred=gen_pred_sub,
+                        categories=ds.categories,
+                        out_path=str(out_dir / "embeddings_tsne.png"),
+                    )
+                except Exception as e:
+                    print(f"Inspector: embedding map failed: {e}")
+
+                # Class prototypes & medoids (from training set)
+                try:
+                    class_prototypes_and_medoids(
+                        texts=ds.train.texts,
+                        labels=ds.train.labels,
+                        emb=train_emb,
+                        categories=ds.categories,
+                        out_json=str(out_dir / "class_prototypes_medoids.json"),
+                    )
+                except Exception as e:
+                    print(f"Inspector: prototypes/medoids failed: {e}")
             else:
                 print("Inspector: skipping NN neighbors because embeddings() not available for this classifier.")
 

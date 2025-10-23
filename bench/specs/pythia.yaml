@@ -1,0 +1,20 @@
+schema: category-mixture-v1
+name: OLMo 1B
+family: OLMo 1B
+tokenizer_name: allenai/OLMo-1B
+categories:
+  - CommonCrawl
+  - C4
+  - GitHub
+  - Wikipedia
+  - Books
+  - Arxiv
+  - StackExchange
+category_weights:
+  CommonCrawl: 42.41
+  C4: 0.0
+  GitHub: 7.59
+  Wikipedia: 1.53
+  Books: 14.99
+  Arxiv: 27.11
+  StackExchange: 6.37
