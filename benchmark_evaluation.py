@@ -7,16 +7,15 @@ for different approaches to estimating training data mixture proportions from
 language model generations.
 
 Usage:
-    python benchmark_evaluation.py --results_dir out/labelshift_llama7b --ground_truth bench/specs/llama-1.yaml
-    python benchmark_evaluation.py --compare out/method1 out/method2 --ground_truth bench/specs/llama-1.yaml
+    python benchmark_evaluation.py --results_dir out/labelshift_llama7b --ground_truth bench/specs/llama-1.yaml [--tol 0.02]
+    python benchmark_evaluation.py --compare out/method1 out/method2 --ground_truth bench/specs/llama-1.yaml [--tol 0.02]
 """
 
 import argparse
 import json
 import yaml
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+# Matplotlib is only needed for plotting; import lazily in plot methods
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
@@ -43,17 +42,23 @@ class BenchmarkMetrics:
     relative_errors: Dict[str, float]
     coverage_rate: Optional[float] = None  # For methods with confidence intervals
     interval_widths: Optional[Dict[str, float]] = None
+    # Derived accuracy-style metrics
+    # overlap_accuracy = 1 - 0.5 * L1, in [0,1]
+    overlap_accuracy: float = 0.0
+    # within_tolerance_rate = fraction of categories with |err| <= tol (if tol provided)
+    within_tolerance_rate: Optional[float] = None
 
 
 class LabelShiftBenchmark:
     """Main benchmark evaluation class"""
     
-    def __init__(self, ground_truth_file: str):
+    def __init__(self, ground_truth_file: str, tol: Optional[float] = None):
         """
         Initialize benchmark with ground truth mixture proportions.
         
         Args:
             ground_truth_file: Path to YAML file with true category weights
+            tol: Optional absolute tolerance for per-category accuracy
         """
         self.ground_truth_file = ground_truth_file
         self.ground_truth = self._load_ground_truth(ground_truth_file)
@@ -61,6 +66,8 @@ class LabelShiftBenchmark:
         self.gt_categories_7 = list(self.ground_truth.keys())
         # Back-compat: some methods still reference self.categories
         self.categories = list(self.ground_truth.keys())
+        # Optional absolute tolerance for per-category accuracy
+        self.tolerance: Optional[float] = tol
         
     def _load_ground_truth(self, filepath: str) -> Dict[str, float]:
         """Load ground truth proportions from YAML specification"""
@@ -92,7 +99,7 @@ class LabelShiftBenchmark:
         with open(summary_file, 'r') as f:
             data = json.load(f)
         
-        # Extract estimates (use bootstrap mean if available, otherwise point estimate)
+        # Extract estimates (prefer priors; fall back to known alternative fields)
         if 'priors' in data:
             if 'mean' in data['priors']:
                 estimates_list = data['priors']['mean']
@@ -101,6 +108,10 @@ class LabelShiftBenchmark:
             else:
                 estimates_list = data['priors']['point']
                 ci_lo = ci_hi = None
+        elif 'global_mixture_over_sampled_pool' in data:
+            # Fallback format used by some methods (e.g., minkpp_mix). No CI provided.
+            estimates_list = data['global_mixture_over_sampled_pool']
+            ci_lo = ci_hi = None
         else:
             raise ValueError(f"No prior estimates found in {summary_file}")
         
@@ -297,6 +308,15 @@ class LabelShiftBenchmark:
         abs_errors = np.abs(true_probs - est_probs)
         max_abs_error = np.max(abs_errors)
         mean_abs_error = np.mean(abs_errors)
+
+        # Accuracy-style metrics
+        # Overlap accuracy: 1 - TV distance = 1 - 0.5 * L1, bounded in [0,1]
+        overlap_accuracy = float(1.0 - 0.5 * l1_distance)
+        # Within-tolerance rate if a tolerance is provided
+        within_tol_rate: Optional[float] = None
+        if getattr(self, 'tolerance', None) is not None:
+            tol = float(self.tolerance)  # type: ignore[arg-type]
+            within_tol_rate = float(np.mean(abs_errors <= tol))
         
         # Relative errors (avoid division by zero)
         rel_errors = {}
@@ -336,7 +356,9 @@ class LabelShiftBenchmark:
             mean_absolute_error=mean_abs_error,
             relative_errors=rel_errors,
             coverage_rate=coverage_rate,
-            interval_widths=interval_widths
+            interval_widths=interval_widths,
+            overlap_accuracy=overlap_accuracy,
+            within_tolerance_rate=within_tol_rate,
         )
     
     def compare_methods(self, results_dirs: List[str]) -> pd.DataFrame:
@@ -361,6 +383,10 @@ class LabelShiftBenchmark:
                     'Max Abs Error': f"{metrics.max_absolute_error:.4f}",
                     'Mean Abs Error': f"{metrics.mean_absolute_error:.4f}",
                 }
+                # Add accuracy-style summaries
+                row['Accuracy (1 - L1/2)'] = f"{metrics.overlap_accuracy:.4f}"
+                if metrics.within_tolerance_rate is not None:
+                    row['Within Tol'] = f"{metrics.within_tolerance_rate:.2%}"
                 if metrics.coverage_rate is not None:
                     row['CI Coverage'] = f"{metrics.coverage_rate:.2%}"
                     avg_width = np.mean(list(metrics.interval_widths.values()))
@@ -373,6 +399,7 @@ class LabelShiftBenchmark:
     
     def plot_comparison(self, results_dirs: List[str], output_path: str = "benchmark_comparison.png"):
         """Create comprehensive comparison plots with adaptive 6/7-class alignment."""
+        import matplotlib.pyplot as plt
         methods: List[MethodResult] = []
         for d in results_dirs:
             try:
@@ -551,7 +578,10 @@ class LabelShiftBenchmark:
                     f"- KL Divergence: {metrics.kl_divergence:.4f}",
                     f"- Mean Absolute Error: {metrics.mean_absolute_error:.4f}",
                     f"- Max Absolute Error: {metrics.max_absolute_error:.4f}",
+                    f"- Accuracy (1 - L1/2): {metrics.overlap_accuracy:.4f}",
                 ])
+                if metrics.within_tolerance_rate is not None:
+                    report_lines.append(f"- Within-Tolerance Accuracy: {metrics.within_tolerance_rate:.2%}")
                 if metrics.coverage_rate is not None:
                     report_lines.append(f"- Confidence Interval Coverage: {metrics.coverage_rate:.2%}")
                     avg_width = np.mean(list(metrics.interval_widths.values()))
@@ -577,6 +607,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="benchmark_output", help="Output directory for plots and reports")
     parser.add_argument("--no_plots", action="store_true", help="Skip generating plots")
     parser.add_argument("--no_report", action="store_true", help="Skip generating markdown report")
+    parser.add_argument("--tol", type=float, default=None, help="Absolute tolerance for per-category accuracy (e.g., 0.02)")
     
     args = parser.parse_args()
     
@@ -585,7 +616,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
     
     # Initialize benchmark
-    benchmark = LabelShiftBenchmark(args.ground_truth)
+    benchmark = LabelShiftBenchmark(args.ground_truth, tol=args.tol)
     
     # Determine methods to evaluate
     if args.results_dir:
@@ -605,6 +636,9 @@ def main():
         print(f"KL Divergence: {metrics.kl_divergence:.4f}")
         print(f"Mean Absolute Error: {metrics.mean_absolute_error:.4f}")
         print(f"Max Absolute Error: {metrics.max_absolute_error:.4f}")
+        print(f"Accuracy (1 - L1/2): {metrics.overlap_accuracy:.4f}")
+        if metrics.within_tolerance_rate is not None:
+            print(f"Within-Tolerance Accuracy: {metrics.within_tolerance_rate:.2%} (tol={args.tol})")
         
         if metrics.coverage_rate is not None:
             print(f"CI Coverage Rate: {metrics.coverage_rate:.2%}")
