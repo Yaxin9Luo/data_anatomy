@@ -5,3 +5,6 @@ data_samples/
 __pycache__/
 benchmark_output/
 mink-plus-plus/
+miniconda/
+Amber/
+llama-7b/
