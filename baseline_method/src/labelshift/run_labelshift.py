@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Optional, List
+from itertools import cycle, islice
 
 import numpy as np
 from tqdm import tqdm
@@ -151,10 +152,17 @@ def main() -> None:
         # Get prompts
         if args.prompts_file:
             prompts = load_prompts_from_file(args.prompts_file)
-            prompts = prompts[: args.num_prompts]
         else:
             print("Using neutral prompts !!!!!!!!!!!!!!!!!")
-            prompts = NEUTRAL_PROMPTS[: args.num_prompts]
+            prompts = NEUTRAL_PROMPTS
+
+        if not prompts:
+            raise ValueError("No prompts available for generation")
+        if args.num_prompts is not None and args.num_prompts > 0:
+            if len(prompts) >= args.num_prompts:
+                prompts = prompts[: args.num_prompts]
+            else:
+                prompts = list(islice(cycle(prompts), args.num_prompts))
 
         # Generate texts using the selected engine
         if args.generator == "hf":
