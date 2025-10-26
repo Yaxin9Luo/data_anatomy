@@ -11,7 +11,7 @@ This repo provides two complementary methods to estimate category mixtures of la
 1) Install dependencies (GPU recommended for HF models):
 
 ```
-pip install -U torch transformers scikit-learn numpy pandas tqdm matplotlib pyyaml datasets
+pip install -U torch transformers scikit-learn numpy pandas tqdm matplotlib pyyaml datasets accelerate
 # Optional for SlimPajama .jsonl.zst sampling
 pip install zstandard
 ```
