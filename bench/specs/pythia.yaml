@@ -1,7 +1,7 @@
 schema: category-mixture-v1
-name: OLMo 1B
-family: OLMo 1B
-tokenizer_name: allenai/OLMo-1B
+name: Pythia 2.8B 
+family:  Pythia 2.8B
+tokenizer_name: EleutherAI/pythia-2.8b
 categories:
   - CommonCrawl
   - C4
