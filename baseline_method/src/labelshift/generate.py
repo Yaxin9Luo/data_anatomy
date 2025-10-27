@@ -234,19 +234,6 @@ def generate_texts(
         # Model is on a single device
         first_device = next(model.parameters()).device
         use_device_map = False
-    
-    # Optional torch.Generator for reproducible sampling across devices
-    gen_obj = None
-    if seed is not None:
-        try:
-            if first_device.type == "cuda":
-                gen_obj = torch.Generator(device=first_device)
-            else:
-                gen_obj = torch.Generator()
-            gen_obj.manual_seed(int(seed))
-        except Exception:
-            gen_obj = None
-
     for i in tqdm(range(0, len(prompts), batch_size), total=(len(prompts)+batch_size-1)//batch_size, desc="Generating"):
         batch = prompts[i : i + batch_size]
         enc = tok(batch, return_tensors="pt", padding=True)
@@ -271,7 +258,6 @@ def generate_texts(
                     top_p=top_p,
                     max_new_tokens=max_new_tokens,
                     pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
-                    generator=gen_obj,
                 )
             except Exception as e:
                 msg = str(e)
@@ -286,7 +272,6 @@ def generate_texts(
                     max_new_tokens=max_new_tokens,
                     pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
                     use_cache=False,
-                    generator=gen_obj,
                 )
         texts = tok.batch_decode(gen, skip_special_tokens=True)
         # Strip the original prompt to keep only generations after the prompt
