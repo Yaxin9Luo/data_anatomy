@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--merge_web", action="store_true", help="Merge CommonCrawl and C4 into a single Web class (6-way)")
     p.add_argument("--max_per_class", type=int, default=5000)
     p.add_argument("--val_fraction", type=float, default=0.2)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=0)
 
     # Classifier
     p.add_argument("--classifier", type=str, choices=["tfidf", "distilbert"], default="distilbert")

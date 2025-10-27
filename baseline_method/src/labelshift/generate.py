@@ -1,4 +1,5 @@
 from typing import List, Optional
+import inspect
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -234,6 +235,27 @@ def generate_texts(
         # Model is on a single device
         first_device = next(model.parameters()).device
         use_device_map = False
+    
+    # Optional torch.Generator for reproducible sampling across devices
+    gen_obj = None
+    if seed is not None:
+        try:
+            if first_device.type == "cuda":
+                gen_obj = torch.Generator(device=first_device)
+            else:
+                gen_obj = torch.Generator()
+            gen_obj.manual_seed(int(seed))
+        except Exception:
+            gen_obj = None
+
+    # Detect whether this transformers version supports `generator` kwarg
+    supports_generator = False
+    try:
+        sig = inspect.signature(model.generate)
+        supports_generator = "generator" in sig.parameters
+    except Exception:
+        supports_generator = False
+
     for i in tqdm(range(0, len(prompts), batch_size), total=(len(prompts)+batch_size-1)//batch_size, desc="Generating"):
         batch = prompts[i : i + batch_size]
         enc = tok(batch, return_tensors="pt", padding=True)
@@ -250,29 +272,78 @@ def generate_texts(
             enc = enc.to(first_device)
             
         with torch.no_grad():
+            # If `generator` kwarg is not supported, set and restore global RNG around generate
+            use_local_rng = (seed is not None) and (not supports_generator)
+            if use_local_rng:
+                batch_seed = int(seed) + i
+                cpu_state = torch.get_rng_state()
+                cuda_states = None
+                if torch.cuda.is_available():
+                    try:
+                        cuda_states = torch.cuda.get_rng_state_all()
+                    except Exception:
+                        cuda_states = None
+                torch.manual_seed(batch_seed)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.manual_seed_all(batch_seed)
+                    except Exception:
+                        pass
             try:
-                gen = model.generate(
-                    **enc,
+                gen_kwargs = dict(
+                    enc,
                     do_sample=True,
                     temperature=temperature,
                     top_p=top_p,
                     max_new_tokens=max_new_tokens,
-                    pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
+                    pad_token_id=(getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None)),
                 )
+                if supports_generator and gen_obj is not None:
+                    gen_kwargs["generator"] = gen_obj
+                gen = model.generate(**gen_kwargs)
             except Exception as e:
-                msg = str(e)
                 # Known issue: some OLMo/hf_olmo revisions error on None past_key_values.
-                # Fallback: retry with use_cache=False and hint about pinning revision.
-                print(f"Generation error: {e}\nRetrying with use_cache=False. Consider pinning --hf_revision to a known-good checkpoint.")
-                gen = model.generate(
-                    **enc,
+                # Also handle older transformers that do not support `generator` kwarg.
+                print(
+                    f"Generation error: {e}\n"
+                    "Retrying with use_cache=False and without generator if unsupported. "
+                    "Consider pinning --hf_revision to a known-good checkpoint."
+                )
+                gen_kwargs = dict(
+                    enc,
                     do_sample=True,
                     temperature=temperature,
                     top_p=top_p,
                     max_new_tokens=max_new_tokens,
-                    pad_token_id=getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None),
+                    pad_token_id=(getattr(model.config, "pad_token_id", None) or getattr(tok, "pad_token_id", None)),
                     use_cache=False,
                 )
+                # Only pass generator if supported
+                if supports_generator and gen_obj is not None:
+                    gen_kwargs["generator"] = gen_obj
+                try:
+                    gen = model.generate(**gen_kwargs)
+                except Exception as e2:
+                    # Final fallback: remove generator entirely
+                    if "generator" in gen_kwargs:
+                        gen_kwargs.pop("generator", None)
+                    gen = model.generate(**gen_kwargs)
+            finally:
+                if use_local_rng:
+                    try:
+                        torch.set_rng_state(cpu_state)
+                        if cuda_states is not None:
+                            # Restore per-device CUDA RNG states if available
+                            try:
+                                torch.cuda.set_rng_state_all(cuda_states)
+                            except Exception:
+                                # Best-effort: restore on current device only
+                                try:
+                                    torch.cuda.set_rng_state(cuda_states[0])
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
         texts = tok.batch_decode(gen, skip_special_tokens=True)
         # Strip the original prompt to keep only generations after the prompt
         for p, full in zip(batch, texts):
