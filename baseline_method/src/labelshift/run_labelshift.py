@@ -176,6 +176,7 @@ def main() -> None:
                 top_p=args.top_p,
                 batch_size=args.gen_batch_size,
                 revision=args.hf_revision,
+                seed=args.seed,
             )
         else:
             raise ValueError(f"Unknown generator: {args.generator}")
@@ -226,6 +227,7 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "gen_temperature": args.gen_temperature,
             "top_p": args.top_p,
+            "gen_seed": args.seed,
             "hf_revision": args.hf_revision,
             "hf_model_name": args.hf_model_name,
             "hf_epochs": args.hf_epochs,
