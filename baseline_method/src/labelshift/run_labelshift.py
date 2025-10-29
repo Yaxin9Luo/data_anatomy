@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from itertools import cycle, islice
 
 import numpy as np
@@ -10,7 +10,7 @@ from tqdm import tqdm
 from data_utils import build_balanced_splits
 from classifier import train_tfidf_classifier, train_distilbert_classifier
 from generate import generate_texts, NEUTRAL_PROMPTS
-from prior import estimate_priors_least_squares, bootstrap_priors
+from prior import estimate_priors_least_squares
 from viz import plot_confusion_matrix, plot_priors_with_ci, plot_pbar_vs_ctpi
 from inspect_viz import (
     plot_assignment_sankey,
@@ -63,6 +63,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--gen_batch_size", type=int, default=8)
 
+    # Unknown thresholding (confidence-based)
+    p.add_argument(
+        "--unknown_threshold",
+        type=float,
+        default=0.9,
+        help="If set (0<τ≤1), scale known-class probabilities by confidence and assign residual to Unknown",
+    )
+    p.add_argument(
+        "--unknown_metric",
+        type=str,
+        default="maxprob",
+        choices=["maxprob"],
+        help="Confidence score used for Unknown thresholding (currently only maxprob is supported)",
+    )
+
     # Bootstrap
     p.add_argument("--bootstrap", action="store_true")
     p.add_argument("--n_boot", type=int, default=300)
@@ -101,6 +116,27 @@ def read_jsonl_texts(path: str) -> List[str]:
             if isinstance(t, str) and t.strip():
                 arr.append(t)
     return arr
+
+
+def apply_unknown_threshold(
+    probs: np.ndarray,
+    threshold: float,
+    metric: str = "maxprob",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if probs.ndim != 2:
+        raise ValueError("probs must be 2D")
+    if metric != "maxprob":
+        raise ValueError(f"Unsupported unknown_metric: {metric}")
+    if not (0.0 < threshold <= 1.0):
+        raise ValueError("--unknown_threshold must satisfy 0 < threshold ≤ 1")
+    if probs.shape[0] == 0:
+        return probs.copy(), np.zeros((0,), dtype=float), np.zeros((0,), dtype=float)
+
+    max_probs = probs.max(axis=1)
+    denom = max(threshold, 1e-8)
+    unknown_mass = np.clip((threshold - max_probs) / denom, 0.0, 1.0)
+    scaled = probs * (1.0 - unknown_mass)[:, None]
+    return scaled, unknown_mass, max_probs
 
 
 def main() -> None:
@@ -188,29 +224,88 @@ def main() -> None:
         batch = gen_texts[i:i+bs]
         probs_chunks.append(model.predict_proba(batch))
     probs = np.concatenate(probs_chunks, axis=0) if probs_chunks else np.zeros((0, K))
-    pbar = probs.mean(axis=0)
+
+    unknown_threshold = args.unknown_threshold
+    if unknown_threshold is not None and probs.shape[0] > 0:
+        scaled_probs, unknown_mass, max_probs = apply_unknown_threshold(
+            probs,
+            threshold=float(unknown_threshold),
+            metric=args.unknown_metric,
+        )
+    else:
+        scaled_probs = probs
+        unknown_mass = np.zeros((probs.shape[0],), dtype=float)
+        max_probs = probs.max(axis=1) if probs.shape[0] > 0 else np.zeros((0,), dtype=float)
+
+    unknown_mean = float(unknown_mass.mean()) if unknown_mass.size > 0 else 0.0
+    known_mass = max(1e-8, 1.0 - unknown_mean)
+    pbar_raw = scaled_probs.mean(axis=0) if scaled_probs.size > 0 else np.zeros((K,))
+    pbar = pbar_raw / known_mass if pbar_raw.size > 0 else np.zeros((K,))
 
     # 5) Prior correction: solve for mixture pi
     pi = estimate_priors_least_squares(C, pbar)
 
-    # 6) Optional bootstrap for CIs
+    # 6) Optional bootstrap for CIs (known categories + unknown mass)
     pi_mean = pi
     lo = np.zeros_like(pi)
     hi = np.zeros_like(pi)
-    if args.bootstrap:
+    unknown_ci_lo = unknown_mean
+    unknown_ci_hi = unknown_mean
+    unknown_bootstrap_mean = unknown_mean
+
+    pi_ext_point = np.concatenate([pi * (1.0 - unknown_mean), np.array([unknown_mean])])
+    pi_mean_ext = pi_ext_point.copy()
+    lo_ext = np.concatenate([lo * (1.0 - unknown_mean), np.array([unknown_mean])])
+    hi_ext = np.concatenate([hi * (1.0 - unknown_mean), np.array([unknown_mean])])
+
+    if args.bootstrap and probs.shape[0] > 0:
         # Manual bootstrap loop to expose progress bar
         rng = np.random.default_rng(args.seed)
         N = probs.shape[0]
         pis = []
+        pis_ext = []
+        unknown_records: List[float] = []
         for _ in tqdm(range(args.n_boot), desc="Bootstrapping"):
             idx = rng.integers(0, N, size=N)
-            pbar_b = probs[idx].mean(axis=0)
+            um_b = float(unknown_mass[idx].mean())
+            km_b = max(1e-8, 1.0 - um_b)
+            scaled_mean_b = scaled_probs[idx].mean(axis=0)
+            if scaled_mean_b.size == 0:
+                continue
+            pbar_b = scaled_mean_b / km_b
             pi_b = estimate_priors_least_squares(C, pbar_b)
             pis.append(pi_b)
-        P = np.stack(pis, axis=0)
-        pi_mean = P.mean(axis=0)
-        lo = np.percentile(P, 2.5, axis=0)
-        hi = np.percentile(P, 97.5, axis=0)
+            pis_ext.append(np.concatenate([pi_b * (1.0 - um_b), np.array([um_b])]))
+            unknown_records.append(um_b)
+        if pis:
+            P = np.stack(pis, axis=0)
+            pi_mean = P.mean(axis=0)
+            lo = np.percentile(P, 2.5, axis=0)
+            hi = np.percentile(P, 97.5, axis=0)
+        if pis_ext:
+            P_ext = np.stack(pis_ext, axis=0)
+            pi_mean_ext = P_ext.mean(axis=0)
+            lo_ext = np.percentile(P_ext, 2.5, axis=0)
+            hi_ext = np.percentile(P_ext, 97.5, axis=0)
+        if unknown_records:
+            unknown_bootstrap = np.array(unknown_records, dtype=float)
+            unknown_bootstrap_mean = float(unknown_bootstrap.mean())
+            unknown_ci_lo = float(np.percentile(unknown_bootstrap, 2.5))
+            unknown_ci_hi = float(np.percentile(unknown_bootstrap, 97.5))
+
+    unknown_mass_for_plot = unknown_bootstrap_mean
+    pbar_ext = None
+    if args.unknown_threshold is not None:
+        if pbar.size > 0:
+            p_known_scaled = pbar * max(0.0, 1.0 - unknown_mass_for_plot)
+        else:
+            p_known_scaled = np.zeros((K,), dtype=float)
+        pbar_ext = np.concatenate([p_known_scaled, np.array([unknown_mass_for_plot])])
+
+    if args.unknown_threshold is not None:
+        print(
+            f"Average unknown probability (threshold {args.unknown_threshold:.3f}): {unknown_bootstrap_mean:.3f}"
+        )
 
     # 7) Write outputs (out_dir already created)
 
@@ -248,7 +343,24 @@ def main() -> None:
             "ci_lo": lo.tolist(),
             "ci_hi": hi.tolist(),
         },
+        "unknown": {
+            "mode": "threshold" if args.unknown_threshold is not None else "disabled",
+            "metric": args.unknown_metric,
+            "threshold": args.unknown_threshold,
+            "mean_probability": unknown_bootstrap_mean,
+            "ci_lo": unknown_ci_lo,
+            "ci_hi": unknown_ci_hi,
+        },
+        "categories_with_unknown": ds.categories + ["Unknown"],
+        "priors_with_unknown": {
+            "point": pi_ext_point.tolist(),
+            "mean": pi_mean_ext.tolist(),
+            "ci_lo": lo_ext.tolist(),
+            "ci_hi": hi_ext.tolist(),
+        },
     }
+    if pbar_ext is not None:
+        payload["pbar_with_unknown"] = pbar_ext.tolist()
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -256,6 +368,7 @@ def main() -> None:
         f.write("category,pi,ci_lo,ci_hi\n")
         for c, p, a, b in zip(ds.categories, pi_mean, lo, hi):
             f.write(f"{c},{p:.6f},{a:.6f},{b:.6f}\n")
+        f.write(f"Unknown,{unknown_bootstrap_mean:.6f},{unknown_ci_lo:.6f},{unknown_ci_hi:.6f}\n")
 
     print(f"Wrote label-shift outputs to {out_dir}")
 
@@ -318,18 +431,36 @@ def main() -> None:
                 writer = csv.writer(fcsv)
                 # If prompts variable exists in scope, we will include prompt metadata; else leave blank
                 have_prompts = 'prompts' in locals()
-                writer.writerow(["gen_index", "prompt_id", "pred_class", "top1_conf", "top3", "prompt", "text_snippet"])
+                writer.writerow([
+                    "gen_index",
+                    "prompt_id",
+                    "pred_class",
+                    "top1_conf",
+                    "top3",
+                    "prompt",
+                    "text_snippet",
+                    "unknown_prob",
+                    "in_known_pool",
+                ])
+                thr = float(args.unknown_threshold) if args.unknown_threshold is not None else None
                 for i, (pp, txt) in enumerate(zip(probs, gen_texts)):
                     pr_idx = i if have_prompts else ""
                     pr_text = (prompts[i] if have_prompts and i < len(prompts) else "")
+                    top_conf = float(max_probs[i]) if max_probs.size else (float(np.max(pp)) if pp.size else 0.0)
+                    pred_idx = int(np.argmax(pp)) if pp.size else 0
+                    is_unknown = bool(thr is not None and top_conf < thr)
+                    pred_label = "Unknown" if is_unknown else ds.categories[pred_idx]
+                    unk_prob = float(unknown_mass[i]) if unknown_mass.size else 0.0
                     writer.writerow([
                         i,
                         pr_idx,
-                        ds.categories[int(np.argmax(pp))],
-                        f"{float(np.max(pp)):.3f}",
+                        pred_label,
+                        f"{top_conf:.3f}",
                         "|".join(_topk_info(pp, ds.categories)),
                         str(pr_text).replace("\n", " "),
-                        txt[: args.snippet_len].replace("\n", " ")
+                        txt[: args.snippet_len].replace("\n", " "),
+                        f"{unk_prob:.3f}",
+                        "yes" if not is_unknown else "no",
                     ])
 
             # HTML gallery for generated assignments
@@ -360,12 +491,17 @@ def main() -> None:
                 import json as _json
                 neigh_path = out_dir / "gen_neighbors.jsonl"
                 with open(neigh_path, "w", encoding="utf-8") as fj:
+                    thr_local = float(args.unknown_threshold) if args.unknown_threshold is not None else None
                     for gi in range(m):
                         pp = probs[gi]
+                        top_conf = float(max_probs[gi]) if max_probs.size else (float(np.max(pp)) if pp.size else 0.0)
+                        pred_idx = int(np.argmax(pp)) if pp.size else 0
+                        is_unknown = bool(thr_local is not None and top_conf < thr_local)
+                        pred_label = "Unknown" if is_unknown else ds.categories[pred_idx]
                         rec = {
                             "gen_index": gi,
-                            "pred_class": ds.categories[int(np.argmax(pp))],
-                            "top1_conf": float(np.max(pp)),
+                            "pred_class": pred_label,
+                            "top1_conf": top_conf,
                             "text_snippet": sub_gen_texts[gi][: args.snippet_len],
                             "neighbors": []
                         }
@@ -431,9 +567,24 @@ def main() -> None:
     # 9) Visualizations
     try:
         plot_confusion_matrix(C, ds.categories, str(out_dir / "confusion_matrix.png"))
-        plot_priors_with_ci(ds.categories, pi_mean, lo, hi, str(out_dir / "priors.png"))
-        Ctpi = (C.T @ pi_mean)
-        plot_pbar_vs_ctpi(ds.categories, pbar, Ctpi, str(out_dir / "pbar_vs_ctpi.png"))
+        Ctpi_known = (C.T @ pi_mean)
+        if args.unknown_threshold is not None:
+            cats_plot = ds.categories + ["Unknown"]
+            plot_priors_with_ci(cats_plot, pi_mean_ext, lo_ext, hi_ext, str(out_dir / "priors.png"))
+            unknown_mass_plot = float(unknown_mass_for_plot)
+            if pbar_ext is not None:
+                pbar_plot = pbar_ext
+            else:
+                if pbar.size > 0:
+                    p_known_scaled = pbar * max(0.0, 1.0 - unknown_mass_plot)
+                else:
+                    p_known_scaled = np.zeros((K,), dtype=float)
+                pbar_plot = np.concatenate([p_known_scaled, np.array([unknown_mass_plot])])
+            Ctpi_ext = np.concatenate([Ctpi_known * max(0.0, 1.0 - unknown_mass_plot), np.array([unknown_mass_plot])])
+            plot_pbar_vs_ctpi(cats_plot, pbar_plot, Ctpi_ext, str(out_dir / "pbar_vs_ctpi.png"))
+        else:
+            plot_priors_with_ci(ds.categories, pi_mean, lo, hi, str(out_dir / "priors.png"))
+            plot_pbar_vs_ctpi(ds.categories, pbar, Ctpi_known, str(out_dir / "pbar_vs_ctpi.png"))
     except Exception as e:
         print(f"Warning: plotting failed: {e}")
 
